@@ -716,5 +716,309 @@
     // Initialize client
     setupSupabase();
   </script>
+
+<!-- === VerbLearner My Stats Add-on (non-destructive) === -->
+<script>
+(function(){
+  // Create styles for the stats UI and responsive mobile-only button
+  const styles = `
+  /* Stats slide-over */
+  #vl-stats-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;z-index:9998}
+  #vl-stats-panel{position:fixed;top:0;right:0;height:100vh;width:min(720px,100vw);background:#fff;color:#111;
+    box-shadow:-8px 0 24px rgba(0,0,0,.2);transform:translateX(100%);transition:transform .24s ease;
+    display:flex;flex-direction:column;z-index:9999}
+  #vl-stats-panel.open{transform:translateX(0)}
+  #vl-stats-header{display:flex;align-items:center;gap:.75rem;padding:14px 16px;border-bottom:1px solid #e5e7eb}
+  #vl-stats-header h3{margin:0;font-size:1.1rem}
+  #vl-stats-close{margin-left:auto}
+  #vl-stats-body{padding:12px 16px;overflow:auto}
+  .vl-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:14px}
+  .vl-card{border:1px solid #e5e7eb;border-radius:12px;padding:12px}
+  .vl-card h4{margin:.2rem 0 .6rem 0;font-size:.95rem}
+  .vl-metric{font-size:1.6rem;font-weight:700}
+  .vl-sub{font-size:.85rem;opacity:.8}
+  .vl-table{width:100%;border-collapse:collapse;font-size:.9rem}
+  .vl-table th,.vl-table td{border-bottom:1px solid #f1f5f9;padding:6px 8px;text-align:left;vertical-align:top}
+  .vl-table th{font-weight:700;background:#fafafa;position:sticky;top:0}
+  .vl-badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #e5e7eb;font-size:.8rem}
+  .vl-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .vl-actions{display:flex;gap:8px;align-items:center}
+  .vl-hint{font-size:.85rem;opacity:.8}
+  /* Clickable username */
+  #authStatus.vl-clickable{cursor:pointer;text-decoration:underline;text-decoration-style:dotted}
+  /* Mobile-only Stats button */
+  .vl-mobile-stats{display:none}
+  @media (max-width: 768px){
+    .vl-mobile-stats{display:inline-flex;align-items:center;gap:.4rem}
+  }
+  `;
+  const stl = document.createElement('style');
+  stl.textContent = styles;
+  document.head.appendChild(stl);
+
+  // Helper: format percentage
+  function pct(n, d){
+    if(!d) return '—';
+    const v = (n/d)*100;
+    return `${v.toFixed(v >= 99 || v === 0 ? 0 : v >= 10 ? 1 : 1)}%`;
+  }
+  // Helper: CSV download
+  function downloadCSV(filename, rows){
+    const header = Object.keys(rows[0] || {infinitive:"", mood:"", tense:"", form:"", attempts:0, correct:0, accuracy:"", updated_at:"", last_answer:""});
+    const csv = [header.join(',')].concat(rows.map(r=>header.map(h=>{
+      const val = r[h] ?? '';
+      const s = String(val).replace(/"/g,'""');
+      return `"${s}"`;
+    }).join(','))).join('\\n');
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  }
+
+  // Build modal markup (once)
+  function ensureStatsShell(){
+    if(document.getElementById('vl-stats-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'vl-stats-overlay';
+    overlay.setAttribute('aria-hidden', 'true');
+    overlay.addEventListener('click', (e)=>{
+      if(e.target === overlay) closeStats();
+    });
+    const panel = document.createElement('div');
+    panel.id = 'vl-stats-panel';
+    panel.setAttribute('role','dialog');
+    panel.setAttribute('aria-modal','true');
+    panel.innerHTML = `
+      <div id="vl-stats-header">
+        <button id="vl-stats-back" aria-label="Back" title="Back" style="display:none">← Back</button>
+        <h3>My Stats</h3>
+        <div class="vl-actions" style="margin-left:auto">
+          <button id="vl-stats-export" title="Export CSV">Export CSV</button>
+          <button id="vl-stats-close" aria-label="Close">Close ✕</button>
+        </div>
+      </div>
+      <div id="vl-stats-body" tabindex="0">
+        <div class="vl-cards">
+          <div class="vl-card">
+            <h4>Overall Accuracy</h4>
+            <div class="vl-metric" id="vl-acc-overall">—</div>
+            <div class="vl-sub"><span id="vl-attempts-total">0</span> attempts total</div>
+          </div>
+          <div class="vl-card">
+            <h4>Last 7 Days</h4>
+            <div class="vl-metric" id="vl-acc-7d">—</div>
+            <div class="vl-sub"><span id="vl-attempts-7d">0</span> attempts · <span id="vl-correct-7d">0</span> correct</div>
+          </div>
+        </div>
+
+        <div class="vl-row" style="justify-content:space-between;margin:10px 0 6px 0">
+          <h4 style="margin:0">By Tense</h4>
+          <span class="vl-hint">Top 5 by attempts</span>
+        </div>
+        <table class="vl-table" id="vl-tense-table">
+          <thead><tr><th>Tense</th><th>Attempts</th><th>Accuracy</th></tr></thead>
+          <tbody></tbody>
+        </table>
+
+        <div class="vl-row" style="justify-content:space-between;margin:16px 0 6px 0">
+          <h4 style="margin:0">By Mood</h4>
+          <span class="vl-hint">Top 5 by attempts</span>
+        </div>
+        <table class="vl-table" id="vl-mood-table">
+          <thead><tr><th>Mood</th><th>Attempts</th><th>Accuracy</th></tr></thead>
+          <tbody></tbody>
+        </table>
+
+        <div class="vl-row" style="justify-content:space-between;margin:16px 0 6px 0">
+          <h4 style="margin:0">Recent Activity</h4>
+          <span class="vl-hint">Most recent 10 responses</span>
+        </div>
+        <table class="vl-table" id="vl-recent-table">
+          <thead><tr><th>Verb</th><th>Mood</th><th>Tense</th><th>Last Answer</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    document.body.appendChild(panel);
+
+    // Close logic
+    document.getElementById('vl-stats-close').addEventListener('click', closeStats);
+    document.addEventListener('keydown', (e)=>{
+      if(e.key === 'Escape') closeStats();
+    });
+    document.getElementById('vl-stats-export').addEventListener('click', async ()=>{
+      const rows = await window.vlCollectProgressRows();
+      const csvRows = rows.map(r=>({
+        infinitive: r.infinitive || '',
+        mood: r.mood || '',
+        tense: r.tense || '',
+        form: r.form || '',
+        attempts: r.attempts || 0,
+        correct: r.correct || 0,
+        accuracy: r.attempts ? ((r.correct/r.attempts)*100).toFixed(1)+'%' : '',
+        updated_at: r.updated_at || '',
+        last_answer: r.last_answer || ''
+      }));
+      downloadCSV('verblearner_my_stats.csv', csvRows);
+    });
+  }
+
+  function openStats(){
+    ensureStatsShell();
+    document.getElementById('vl-stats-overlay').style.display = 'block';
+    document.getElementById('vl-stats-panel').classList.add('open');
+    loadAndRenderStats();
+    // Focus for accessibility
+    const body = document.getElementById('vl-stats-body');
+    if(body) body.focus({preventScroll:true});
+  }
+  function closeStats(){
+    const ovl = document.getElementById('vl-stats-overlay');
+    const pnl = document.getElementById('vl-stats-panel');
+    if(ovl) ovl.style.display = 'none';
+    if(pnl) pnl.classList.remove('open');
+  }
+
+  // Data loader that reuses app's existing function if present
+  window.vlCollectProgressRows = async function(){
+    try{
+      if(typeof loadServerProgress === 'function'){
+        const rows = await loadServerProgress();
+        return Array.isArray(rows) ? rows : [];
+      }
+    }catch(e){ console.warn(e); }
+    return [];
+  }
+
+  function aggregate(rows, key){
+    const map = new Map();
+    for(const r of rows){
+      const k = (r[key] ?? '—') || '—';
+      const a = r.attempts|0, c = r.correct|0;
+      const slot = map.get(k) || { attempts:0, correct:0 };
+      slot.attempts += a; slot.correct += c;
+      map.set(k, slot);
+    }
+    return Array.from(map, ([name, v])=>({ name, attempts: v.attempts, correct: v.correct, acc: v.attempts ? v.correct / v.attempts : 0 }))
+      .sort((a,b)=> b.attempts - a.attempts)
+      .slice(0,5);
+  }
+
+  async function loadAndRenderStats(){
+    const rows = await window.vlCollectProgressRows();
+    // Totals
+    let attempts = 0, correct = 0;
+    const now = new Date();
+    let a7=0, c7=0;
+    for(const r of rows){
+      const a = r.attempts|0, c = r.correct|0;
+      attempts += a; correct += c;
+      const ts = r.updated_at ? new Date(r.updated_at) : null;
+      if(ts && (now - ts) <= 7*24*60*60*1000){ a7 += a; c7 += c; }
+    }
+    const accOverall = pct(correct, attempts);
+    const acc7 = pct(c7, a7);
+    const els = {
+      overall: document.getElementById('vl-acc-overall'),
+      total: document.getElementById('vl-attempts-total'),
+      acc7: document.getElementById('vl-acc-7d'),
+      a7: document.getElementById('vl-attempts-7d'),
+      c7: document.getElementById('vl-correct-7d'),
+      tenseTbody: document.querySelector('#vl-tense-table tbody'),
+      moodTbody: document.querySelector('#vl-mood-table tbody'),
+      recentTbody: document.querySelector('#vl-recent-table tbody'),
+    };
+    if(els.overall) els.overall.textContent = accOverall;
+    if(els.total) els.total.textContent = attempts;
+    if(els.acc7) els.acc7.textContent = acc7;
+    if(els.a7) els.a7.textContent = a7;
+    if(els.c7) els.c7.textContent = c7;
+
+    // By Tense & Mood
+    const byTense = aggregate(rows, 'tense');
+    const byMood = aggregate(rows, 'mood');
+    function renderGroup(list, tbody){
+      if(!tbody) return;
+      tbody.innerHTML = '';
+      for(const g of list){
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${g.name}</td><td>${g.attempts}</td><td>${pct(g.correct, g.attempts)}</td>`;
+        tbody.appendChild(tr);
+      }
+    }
+    renderGroup(byTense, els.tenseTbody);
+    renderGroup(byMood, els.moodTbody);
+
+    // Recent 20 (based on last update time)
+    const recent = rows.slice().sort((a,b)=> new Date(b.updated_at||0) - new Date(a.updated_at||0)).slice(0,10);
+    
+      if(els.recentTbody){
+        els.recentTbody.innerHTML = '';
+        for(const r of recent){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${r.infinitive ?? '—'}</td>
+            <td>${r.mood ?? '—'}</td>
+            <td>${r.tense ?? '—'}</td>
+            <td>${(r.last_answer ?? '').toString().substring(0,64)}</td>`;
+          els.recentTbody.appendChild(tr);
+        }
+      }
+
+  }
+
+  // Enhance existing auth UI without altering original functions
+  function enhanceAuthUI(){
+    const st = document.getElementById('authStatus');
+    if(st){
+      st.classList.add('vl-clickable');
+      st.title = 'Open My Stats';
+      st.addEventListener('click', openStats);
+    }
+    // Insert mobile-only Stats button (logged-in only)
+    const controls = document.getElementById('authControls');
+    if(controls && !document.getElementById('btnOpenStats')){
+      const btn = document.createElement('button');
+      btn.id = 'btnOpenStats';
+      btn.className = 'vl-mobile-stats';
+      btn.type = 'button';
+      btn.style.display = 'none'; // default off; we toggle in updateAuthUI shim
+      btn.textContent = 'Stats';
+      btn.addEventListener('click', openStats);
+      controls.insertBefore(btn, controls.firstChild);
+    }
+  }
+
+  // Shim updateAuthUI to also toggle our button
+  const prevUpdate = window.updateAuthUI;
+  window.updateAuthUI = function(user){
+    try{ if(typeof prevUpdate === 'function') prevUpdate(user); }catch(e){ console.warn(e); }
+    try{
+      const st = document.getElementById('authStatus');
+      const statsBtn = document.getElementById('btnOpenStats');
+      if(st){
+        if(user){
+          st.setAttribute('role','button');
+          st.setAttribute('tabindex','0');
+          st.addEventListener('keydown', (e)=>{ if(e.key==='Enter' || e.key===' ') { e.preventDefault(); openStats(); } });
+        }else{
+          st.removeAttribute('role'); st.removeAttribute('tabindex');
+        }
+      }
+      if(statsBtn){
+        // Only display when logged in
+        statsBtn.style.display = user ? '' : 'none';
+      }
+    }catch(e){ console.warn(e); }
+  };
+
+  document.addEventListener('DOMContentLoaded', enhanceAuthUI);
+  // Public opener if needed elsewhere
+  window.openMyStats = openStats;
+})();
+</script>
 </body>
 </html>
